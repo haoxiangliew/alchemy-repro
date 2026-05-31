@@ -37,8 +37,10 @@ install the **unpatched** runtime on demand to demonstrate the bug.
 The single patch file fixes **two** distinct dev-runtime bugs in
 `@distilled.cloud/cloudflare-runtime@0.6.3`:
 
-1. **Worker startup** (`Workerd.mjs`) — a worker silently never starts; what the
-   harness reproduces. See [Fix #1](#fix-1--worker-startup-patches-workerdmjs).
+1. **Worker startup** (`Workerd.mjs` + `find-available-port.mjs`) — a worker
+   silently never starts; what the harness reproduces. Two facets of one Bun
+   stdio-wiring race (the port-report fd **and** the stdin config pipe). See
+   [Fix #1](#fix-1--worker-startup-patches-workerdmjs).
 2. **LocalProxy OOM** (`local-proxy.worker.mjs`) — the `:1337` proxy DO crashes
    with a V8 `ExternalEntityTable` out-of-memory. See
    [Fix #2](#fix-2--localproxy-oom).
@@ -89,42 +91,76 @@ into a concurrently-spawned child. `workerd` serves fine, but its port-report
 goes to a dead fd, so Alchemy never learns the port and never marks the worker
 started — the dev session hangs that worker silently.
 
+This race has **two faces**, both the same Bun bug. The control fd (fd 3) is the
+one the original fix removed — but pre-allocating ports and dropping fd 3 still
+left a residual ~1-in-10 failure (diagnosed in this repro). The runtime also
+pipes each worker's serialized config to `workerd` over **stdin (fd 0)**, and the
+same concurrent-spawn race intermittently drops *that* pipe too. When it does,
+`workerd` reads EOF, gets no config, and exits `1` within ~4 ms — no stdout, no
+stderr, just a silent non-start. The retry loop usually masks it, which is why it
+surfaced as the occasional surviving failure rather than every run.
+
 ## Fix #1 — worker startup (`patches/`, `Workerd.mjs`)
 
-Pre-allocate ports in the parent (`net.createServer().listen(0)`) and rewrite
-each `127.0.0.1:0` socket to the chosen port, then poll readiness via TCP
-`connect` instead of depending on the fd-3 control channel. `workerd` is spawned
-without `--control-fd=3` and with a 3-element `stdio`, so there's no fd ≥ 3 for
-Bun to drop. This makes startup runtime-agnostic. `./run-harness.sh --patch` confirms 10/10.
+Remove **both** inherited-pipe dependencies so no fragile fd wiring sits in the
+worker startup path:
+
+1. **Ports (fd 3).** Pre-allocate each port in the parent
+   (`net.createServer().listen(0)`), rewrite every `127.0.0.1:0` socket to the
+   chosen port, and poll readiness via TCP `connect` instead of the fd-3 control
+   channel. `workerd` is spawned without `--control-fd=3`, so there's no fd ≥ 3
+   for Bun to drop.
+2. **Config (fd 0).** Write the serialized config to a temp file and pass its
+   path to `workerd serve` instead of piping it over stdin, with `stdio[0]` set
+   to `"ignore"`. No stdin pipe means nothing for the race to drop — the config
+   is always present when `workerd` reads it.
+
+Together these make startup depend on no inherited pipes at all. (Failure
+detection also switched from the process `exit` event to `close`, so `workerd`'s
+stderr is fully drained before classification — an empty-stderr crash no longer
+gets mislabeled as a generic error.) The port helpers (`allocatePort`,
+`isPortAvailable`) live in `internal/find-available-port.mjs`, so the patch also
+touches that file. `./run-harness.sh --patch` confirms 10/10; ad-hoc dev loops
+run 60/60.
 
 ```
-❯ ./run-harness.sh 10 10 --both
+❯ ./run-harness.sh 20 --both
 
 >>> Preparing 'unpatched' suite: clean node_modules + .alchemy, toggle patch, bun install
     runtime: UNPATCHED (--control-fd=3, fd-3 port report)
 
-############ SUITE: unpatched  (N=10, grace=10s) ############
+############ SUITE: unpatched  (N=20, grace=4s) ############
   [unpatched] RUN  1: started=3/3  [WorkerA,WorkerB,WorkerC]
-  [unpatched] RUN  2: started=1/3  [WorkerA]   <<< INCOMPLETE
-  [unpatched] RUN  3: started=2/3  [WorkerB,WorkerC]   <<< INCOMPLETE
-  [unpatched] RUN  4: started=2/3  [WorkerA,WorkerB]   <<< INCOMPLETE
-  [unpatched] RUN  5: started=1/3  [WorkerB]   <<< INCOMPLETE
-  [unpatched] RUN  6: started=0/3  []   <<< INCOMPLETE
+  [unpatched] RUN  2: started=0/3  []   <<< INCOMPLETE
+  [unpatched] RUN  3: started=2/3  [WorkerA,WorkerC]   <<< INCOMPLETE
+  [unpatched] RUN  4: started=2/3  [WorkerB,WorkerC]   <<< INCOMPLETE
+  [unpatched] RUN  5: started=2/3  [WorkerA,WorkerC]   <<< INCOMPLETE
+  [unpatched] RUN  6: started=2/3  [WorkerA,WorkerC]   <<< INCOMPLETE
   [unpatched] RUN  7: started=2/3  [WorkerA,WorkerC]   <<< INCOMPLETE
-  [unpatched] RUN  8: started=2/3  [WorkerA,WorkerC]   <<< INCOMPLETE
-  [unpatched] RUN  9: started=1/3  [WorkerB]   <<< INCOMPLETE
-  [unpatched] RUN 10: started=2/3  [WorkerA,WorkerB]   <<< INCOMPLETE
+  [unpatched] RUN  8: started=1/3  [WorkerC]   <<< INCOMPLETE
+  [unpatched] RUN  9: started=1/3  [WorkerA]   <<< INCOMPLETE
+  [unpatched] RUN 10: started=2/3  [WorkerA,WorkerC]   <<< INCOMPLETE
+  [unpatched] RUN 11: started=1/3  [WorkerA]   <<< INCOMPLETE
+  [unpatched] RUN 12: started=2/3  [WorkerA,WorkerC]   <<< INCOMPLETE
+  [unpatched] RUN 13: started=2/3  [WorkerA,WorkerC]   <<< INCOMPLETE
+  [unpatched] RUN 14: started=2/3  [WorkerB,WorkerC]   <<< INCOMPLETE
+  [unpatched] RUN 15: started=2/3  [WorkerB,WorkerC]   <<< INCOMPLETE
+  [unpatched] RUN 16: started=3/3  [WorkerA,WorkerB,WorkerC]
+  [unpatched] RUN 17: started=1/3  [WorkerA]   <<< INCOMPLETE
+  [unpatched] RUN 18: started=2/3  [WorkerB,WorkerC]   <<< INCOMPLETE
+  [unpatched] RUN 19: started=1/3  [WorkerA]   <<< INCOMPLETE
+  [unpatched] RUN 20: started=2/3  [WorkerA,WorkerB]   <<< INCOMPLETE
   --- unpatched distribution (valid samples) ---
     0/3 -> 1 run(s)
-    1/3 -> 3 run(s)
-    2/3 -> 5 run(s)
-    3/3 -> 1 run(s)
-  >>> unpatched: 1/10 valid runs started ALL 3 workers
+    1/3 -> 5 run(s)
+    2/3 -> 12 run(s)
+    3/3 -> 2 run(s)
+  >>> unpatched: 2/20 valid runs started ALL 3 workers
 
 >>> Preparing 'patched' suite: clean node_modules + .alchemy, toggle patch, bun install
     runtime: PATCHED (port pre-alloc + TCP readiness poll, no --control-fd)
 
-############ SUITE: patched  (N=10, grace=10s) ############
+############ SUITE: patched  (N=20, grace=4s) ############
   [patched] RUN  1: started=3/3  [WorkerA,WorkerB,WorkerC]
   [patched] RUN  2: started=3/3  [WorkerA,WorkerB,WorkerC]
   [patched] RUN  3: started=3/3  [WorkerA,WorkerB,WorkerC]
@@ -135,13 +171,23 @@ Bun to drop. This makes startup runtime-agnostic. `./run-harness.sh --patch` con
   [patched] RUN  8: started=3/3  [WorkerA,WorkerB,WorkerC]
   [patched] RUN  9: started=3/3  [WorkerA,WorkerB,WorkerC]
   [patched] RUN 10: started=3/3  [WorkerA,WorkerB,WorkerC]
+  [patched] RUN 11: started=3/3  [WorkerA,WorkerB,WorkerC]
+  [patched] RUN 12: started=3/3  [WorkerA,WorkerB,WorkerC]
+  [patched] RUN 13: started=3/3  [WorkerA,WorkerB,WorkerC]
+  [patched] RUN 14: started=3/3  [WorkerA,WorkerB,WorkerC]
+  [patched] RUN 15: started=3/3  [WorkerA,WorkerB,WorkerC]
+  [patched] RUN 16: started=3/3  [WorkerA,WorkerB,WorkerC]
+  [patched] RUN 17: started=3/3  [WorkerA,WorkerB,WorkerC]
+  [patched] RUN 18: started=3/3  [WorkerA,WorkerB,WorkerC]
+  [patched] RUN 19: started=3/3  [WorkerA,WorkerB,WorkerC]
+  [patched] RUN 20: started=3/3  [WorkerA,WorkerB,WorkerC]
   --- patched distribution (valid samples) ---
-    3/3 -> 10 run(s)
-  >>> patched: 10/10 valid runs started ALL 3 workers
+    3/3 -> 20 run(s)
+  >>> patched: 20/20 valid runs started ALL 3 workers
 
 ================= SUMMARY =================
-  unpatched: 1/10 valid runs started all 3 (0 timed out)
-  patched: 10/10 valid runs started all 3 (0 timed out)
+  unpatched: 2/20 valid runs started all 3 (0 timed out)
+  patched: 20/20 valid runs started all 3 (0 timed out)
 ```
 
 ## Fix #2 — LocalProxy OOM
