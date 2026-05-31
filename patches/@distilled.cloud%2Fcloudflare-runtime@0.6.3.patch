@@ -1,0 +1,176 @@
+diff --git a/node_modules/@distilled.cloud/cloudflare-runtime/.bun-tag-26e21102174475b1 b/.bun-tag-26e21102174475b1
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/dist/workerd/Workerd.mjs b/dist/workerd/Workerd.mjs
+index 0edaecd6635c8f2ce69b96e7c5474453c7abc690..b62ec3ba321f02a478eef1a665dddc25c8570ef1 100644
+--- a/dist/workerd/Workerd.mjs
++++ b/dist/workerd/Workerd.mjs
+@@ -8,7 +8,7 @@ import * as Effect from "effect/Effect";
+ import * as Layer from "effect/Layer";
+ import * as Schedule from "effect/Schedule";
+ import * as NodeChildProcess from "node:child_process";
+-import * as NodeStream from "node:stream";
++import * as NodeNet from "node:net";
+ //#region src/workerd/Workerd.ts
+ var Workerd_exports = /* @__PURE__ */ __exportAll({
+ 	Workerd: () => Workerd,
+@@ -56,61 +56,113 @@ const WorkerdLive = Layer.sync(Workerd, () => {
+ 	return Workerd.of({
+ 		compatibilityDate,
+ 		serve: Effect.fn("Workerd.serve")(function* (config, args) {
++			// Pre-assign a concrete loopback port for every ":0" socket and
++			// port-valued arg, instead of letting workerd pick ephemeral ports
++			// and reporting them back over the control fd (fd 3). Bun's
++			// child_process intermittently fails to wire that extra pipe into a
++			// spawned child (the "listen" messages get written to a dead fd),
++			// which left the worker running-but-unaddressable: no "Started"
++			// log, no error, random victim, worse with more workers. Choosing
++			// the ports up front removes the dependency on fd 3 entirely.
++			const allocatePort = () => new Promise((resolve, reject) => {
++				const probe = NodeNet.createServer();
++				probe.once("error", reject);
++				probe.listen(0, "127.0.0.1", () => {
++					const { port } = probe.address();
++					probe.close(() => resolve(port));
++				});
++			});
++			const portOf = (address) => {
++				const port = Number(String(address).split(":").pop());
++				return Number.isFinite(port) ? port : undefined;
++			};
++			const ports = {};
++			const sockets = [];
++			for (const socket of config.sockets ?? []) {
++				if (typeof socket.address === "string" && socket.address.endsWith(":0")) {
++					const port = yield* Effect.promise(allocatePort);
++					ports[socket.name] = port;
++					sockets.push({ ...socket, address: `127.0.0.1:${port}` });
++				} else {
++					// Already-concrete sockets (e.g. the proxy's fixed :1337):
++					// keep the address, but still record the port so the
++					// returned shape matches the old control-fd behaviour.
++					const port = portOf(socket.address);
++					if (port !== undefined) ports[socket.name] = port;
++					sockets.push(socket);
++				}
++			}
++			const resolvedArgs = { ...args ?? {} };
++			for (const key of ["debug-port", "inspector-addr"]) {
++				const value = resolvedArgs[key];
++				if (typeof value !== "string") continue;
++				if (value.endsWith(":0")) {
++					const port = yield* Effect.promise(allocatePort);
++					ports[key] = port;
++					resolvedArgs[key] = `127.0.0.1:${port}`;
++				} else {
++					const port = portOf(value);
++					if (port !== undefined) ports[key] = port;
++				}
++			}
++			const resolvedConfig = { ...config, sockets };
++			const httpSocket = sockets.find((socket) => socket.name === "http") ?? sockets[0];
++			const readinessPort = httpSocket ? portOf(httpSocket.address) : undefined;
++
+ 			const [handle, kill] = yield* spawn(bin, [
+ 				"serve",
+ 				"--binary",
+ 				"--experimental",
+ 				"--verbose",
+-				"--control-fd=3",
+-				...Object.entries(args ?? {}).map(([key, value]) => typeof value === "boolean" ? `--${key}` : `--${key}=${value}`),
++				...Object.entries(resolvedArgs).map(([key, value]) => typeof value === "boolean" ? `--${key}` : `--${key}=${value}`),
+ 				"-"
+ 			], { stdio: [
+ 				"pipe",
+ 				"inherit",
+-				"pipe",
+ 				"pipe"
+ 			] });
+ 			yield* Effect.addFinalizer(() => kill);
+-			const controlMessages = yield* Effect.callback((resume) => {
+-				const count = (config.sockets?.length ?? 0) + (typeof args?.["debug-port"] !== "undefined" ? 1 : 0) + (typeof args?.["inspector-addr"] !== "undefined" ? 1 : 0);
+-				if (!handle.stdin || !handle.stderr || !(handle.stdio[3] instanceof NodeStream.Readable)) return resume(new SystemError({
+-					subtag: "WorkerdSpawn",
+-					message: "The Workers runtime (workerd) process did not have a stdin, stderr, or control fd."
+-				}));
++
++			// Readiness: poll the assigned HTTP port until workerd accepts a
++			// connection, failing fast if the process exits first.
++			yield* Effect.callback((resume) => {
+ 				let stderr = "";
+-				let control = "";
+-				const onStderr = (data) => {
+-					stderr += data.toString();
+-				};
+-				const onControl = (data) => {
+-					control += data.toString();
+-					const messages = control.split("\n").filter((line) => line.trim() !== "").map((line) => JSON.parse(line));
+-					if (messages.length === count) {
+-						removeListeners();
+-						resume(Effect.succeed(messages));
+-					}
+-				};
+-				const onExit = (code, signal) => {
+-					removeListeners();
+-					resume(classifyWorkerdError(stderr, code, signal));
+-				};
+-				const removeListeners = () => {
++				let settled = false;
++				let pollTimer;
++				let deadline;
++				const onStderr = (data) => { stderr += data.toString(); };
++				const cleanup = () => {
++					clearTimeout(pollTimer);
++					clearTimeout(deadline);
+ 					handle.stderr?.off("data", onStderr);
+-					handle.stdio[3]?.off("data", onControl);
+ 					handle.off("exit", onExit);
+ 				};
++				const settle = (effect) => {
++					if (settled) return;
++					settled = true;
++					cleanup();
++					resume(effect);
++				};
++				const onExit = (code, signal) => settle(classifyWorkerdError(stderr, code, signal));
++				const probe = () => {
++					const socket = NodeNet.connect(readinessPort, "127.0.0.1");
++					socket.once("connect", () => { socket.destroy(); settle(Effect.void); });
++					socket.once("error", () => { socket.destroy(); pollTimer = setTimeout(probe, 50); });
++				};
+ 				handle.stderr?.on("data", onStderr);
+-				handle.stdio[3]?.on("data", onControl);
+ 				handle.on("exit", onExit);
+-				handle.stdin?.write(Buffer.from(serializeConfig(config)));
++				deadline = setTimeout(() => settle(new SystemError({
++					subtag: "WorkerdStartTimeout",
++					message: "The Workers runtime (workerd) did not start listening in time."
++				})), 30e3);
++				handle.stdin?.write(Buffer.from(serializeConfig(resolvedConfig)));
+ 				handle.stdin?.end();
+-				return Effect.sync(removeListeners);
++				probe();
++				return Effect.sync(cleanup);
+ 			});
+-			const ports = {};
+-			for (const message of controlMessages) if (message.event === "listen") ports[message.socket] = message.port;
+ 			return ports;
+ 		}, (effect) => Effect.retry(effect, {
+-			while: (error) => error._tag === "SystemError",
++			while: (error) => error._tag === "SystemError" || error.subtag === "WorkerdAddressInUse",
+ 			schedule: Schedule.both(Schedule.exponential(50), Schedule.recurs(3))
+ 		}))
+ 	});
+diff --git a/dist/workers/proxy/workers/local-proxy.worker.mjs b/dist/workers/proxy/workers/local-proxy.worker.mjs
+index c144780f0cfcdac28c3378bb07b28558514a87d1..7cdbfe668cf4479710e58e15af5b72c43e3bced2 100644
+--- a/dist/workers/proxy/workers/local-proxy.worker.mjs
++++ b/dist/workers/proxy/workers/local-proxy.worker.mjs
+@@ -2,7 +2,7 @@ import __workerModule0 from "../../index-workers-D-dEN6oB.mjs";
+ import __workerModule1 from "../../proxy.shared-CJStcZJN.mjs";
+ 
+ export const modules = [
+-  { name: "proxy/workers/local-proxy.worker.mjs", type: "ESModule", content: "import{i as newWorkersWebSocketRpcResponse,n as newWebSocketRpcSession2}from\"../../index-workers-D-dEN6oB.mjs\";import{n as isProxyControllerRequest,r as CONTROLLER_WEBSOCKET_PATH,t as ProxyError}from\"../../proxy.shared-CJStcZJN.mjs\";import{DurableObject}from\"cloudflare:workers\";var local_proxy_worker_default$1={fetch(request,env){return env.PROXY.get(`global`).fetch(request)}},LocalProxy=class extends DurableObject{workers=new Map;requestQueue=new Map;retryRequestQueue=new Map;async fetch(request){try{return isProxyControllerRequest(request,this.env)?newWorkersWebSocketRpcResponse(request,this.controller):await this.fetchUserWorker(request)}catch(error){return ProxyError.fromUnknown(error).toResponse()}}controller={listWorkers:()=>Array.from(this.workers.keys()),registerWorker:workerName=>{this.workers.get(workerName)||this.workers.set(workerName,{localAddress:void 0,remoteMain:void 0})},unregisterWorker:workerName=>{let worker=this.workers.get(workerName);worker&&(worker.remoteMain?.[Symbol.dispose](),this.workers.delete(workerName))},setLocalAddress:(workerName,address)=>{this.controller.registerWorker(workerName);let worker=this.workers.get(workerName);worker.localAddress=address},unsetLocalAddress:(workerName,address)=>{this.controller.registerWorker(workerName);let worker=this.workers.get(workerName);worker.localAddress===address&&(worker.localAddress=void 0)},setRemoteAddress:async(workerName,address)=>{let url=new URL(address);url.protocol=url.protocol===`https:`?`wss:`:`ws:`,url.pathname=CONTROLLER_WEBSOCKET_PATH;let ws=new WebSocket(url.toString());await new Promise((resolve,reject)=>{ws.addEventListener(`open`,()=>{resolve()}),ws.addEventListener(`error`,event=>{reject(event.error)})});let remoteMain=newWebSocketRpcSession2(ws,this.makeLocalMain(()=>remoteMain),{onSendError:error=>ProxyError.fromUnknown(error)});this.controller.registerWorker(workerName);let worker=this.workers.get(workerName);worker.remoteMain=remoteMain},unsetRemoteAddress:workerName=>{let worker=this.workers.get(workerName);!worker||worker.remoteMain===void 0||(worker.remoteMain?.[Symbol.dispose](),worker.remoteMain=void 0)}};makeLocalMain(remote){return{fetch:async request=>{let response=await this.fetchUserWorker(request);if(response.webSocket){let ws=response.webSocket,id=crypto.randomUUID();return ws.accept({allowHalfOpen:!0}),ws.addEventListener(`message`,event=>{remote().webSocketMessage(id,event.data)}),ws.addEventListener(`close`,event=>{remote().webSocketClose(id,event.code,event.reason,event.wasClean)}),ws.addEventListener(`error`,event=>{remote().webSocketError(id,event.error)}),{_tag:`Upgrade`,status:response.status,headers:response.headers,id}}else return{_tag:`Response`,response}},webSocketMessage:async(id,message)=>{let[target]=this.ctx.getWebSockets(id);target&&target.send(message)},webSocketClose:async(id,code,reason)=>{let[target]=this.ctx.getWebSockets(id);target&&target.close(code,reason)},webSocketError:async(id,error)=>{console.error(`[local] websocket error`,id,error)}}}async fetchUserWorker(request){let promise=Promise.withResolvers();return this.requestQueue.set(request,promise),this.processRequestQueue(),await promise.promise}async processRequestQueue(){for(let[request,promise]of this.getOrderedRequestQueue())try{this.requestQueue.delete(request),this.retryRequestQueue.delete(request);let response=await this.routeUserWorkerRequest(request);promise.resolve(response)}catch(cause){let error=ProxyError.fromUnknown(cause);error.retryable?this.retryRequestQueue.set(request,promise):promise.resolve(error.toResponse())}}*getOrderedRequestQueue(){yield*this.retryRequestQueue,yield*this.requestQueue}async routeUserWorkerRequest(request){let original=new URL(request.url),segments=original.hostname.split(`.`),name=segments[0]?decodeURIComponent(segments[0].toLowerCase()):void 0;if(segments.length<2||!name)throw new ProxyError({message:`The request hostname does not include a worker to route to.`,hint:\"The hostname should be in the format of `<worker-name>.localhost:<port>`, e.g. `my-worker.localhost:1337`.\",status:400});let worker=this.workers.get(name);if(!worker)throw new ProxyError({message:`Worker \"${name}\" not found`,status:502});let localAddress=worker.localAddress;if(!localAddress)throw new ProxyError({message:`Worker address not yet available`,status:503,retryable:!0});try{let proxied=new URL(original.pathname+original.search,localAddress),headers=new Headers(request.headers);return headers.set(`x-forwarded-host`,original.host),headers.set(`x-forwarded-proto`,original.protocol.replace(/:$/,``)),await fetch(proxied,{method:request.method,headers,body:request.body,redirect:`manual`})}catch(error){let worker=this.workers.get(name);throw!worker||worker.localAddress===localAddress?new ProxyError({message:`Failed to fetch worker \"${name}\" (local address: ${localAddress})`,status:502,cause:error}):new ProxyError({message:`Your worker restarted mid-request.`,hint:`Try sending the request again. Only GET and HEAD requests are retried automatically.`,status:503,retryable:request.method===`GET`||request.method===`HEAD`,cause:error})}}},local_proxy_worker_default=local_proxy_worker_default$1??{};export{LocalProxy,local_proxy_worker_default as default};" },
++  { name: "proxy/workers/local-proxy.worker.mjs", type: "ESModule", content: "import{i as newWorkersWebSocketRpcResponse,n as newWebSocketRpcSession2}from\"../../index-workers-D-dEN6oB.mjs\";import{n as isProxyControllerRequest,r as CONTROLLER_WEBSOCKET_PATH,t as ProxyError}from\"../../proxy.shared-CJStcZJN.mjs\";import{DurableObject}from\"cloudflare:workers\";var local_proxy_worker_default$1={fetch(request,env){return env.PROXY.get(`global`).fetch(request)}},LocalProxy=class extends DurableObject{workers=new Map;requestQueue=new Map;retryRequestQueue=new Map;async fetch(request){try{return isProxyControllerRequest(request,this.env)?newWorkersWebSocketRpcResponse(request,this.controller):await this.fetchUserWorker(request)}catch(error){return ProxyError.fromUnknown(error).toResponse()}}controller={listWorkers:()=>Array.from(this.workers.keys()),registerWorker:workerName=>{this.workers.get(workerName)||this.workers.set(workerName,{localAddress:void 0,remoteMain:void 0})},unregisterWorker:workerName=>{let worker=this.workers.get(workerName);worker&&(worker.remoteMain?.[Symbol.dispose](),this.workers.delete(workerName))},setLocalAddress:(workerName,address)=>{this.controller.registerWorker(workerName);let worker=this.workers.get(workerName);worker.localAddress=address},unsetLocalAddress:(workerName,address)=>{this.controller.registerWorker(workerName);let worker=this.workers.get(workerName);worker.localAddress===address&&(worker.localAddress=void 0)},setRemoteAddress:async(workerName,address)=>{let url=new URL(address);url.protocol=url.protocol===`https:`?`wss:`:`ws:`,url.pathname=CONTROLLER_WEBSOCKET_PATH;let ws=new WebSocket(url.toString());await new Promise((resolve,reject)=>{ws.addEventListener(`open`,()=>{resolve()}),ws.addEventListener(`error`,event=>{reject(event.error)})});let remoteMain=newWebSocketRpcSession2(ws,this.makeLocalMain(()=>remoteMain),{onSendError:error=>ProxyError.fromUnknown(error)});this.controller.registerWorker(workerName);let worker=this.workers.get(workerName);worker.remoteMain=remoteMain},unsetRemoteAddress:workerName=>{let worker=this.workers.get(workerName);!worker||worker.remoteMain===void 0||(worker.remoteMain?.[Symbol.dispose](),worker.remoteMain=void 0)}};makeLocalMain(remote){return{fetch:async request=>{let response=await this.fetchUserWorker(request);if(response.webSocket){let ws=response.webSocket,id=crypto.randomUUID();return ws.accept({allowHalfOpen:!0}),ws.addEventListener(`message`,event=>{remote().webSocketMessage(id,event.data)}),ws.addEventListener(`close`,event=>{remote().webSocketClose(id,event.code,event.reason,event.wasClean)}),ws.addEventListener(`error`,event=>{remote().webSocketError(id,event.error)}),{_tag:`Upgrade`,status:response.status,headers:response.headers,id}}else return{_tag:`Response`,response}},webSocketMessage:async(id,message)=>{let[target]=this.ctx.getWebSockets(id);target&&target.send(message)},webSocketClose:async(id,code,reason)=>{let[target]=this.ctx.getWebSockets(id);target&&target.close(code,reason)},webSocketError:async(id,error)=>{console.error(`[local] websocket error`,id,error)}}}async fetchUserWorker(request){while(!0)try{return await this.routeUserWorkerRequest(request)}catch(cause){let error=ProxyError.fromUnknown(cause);if(!error.retryable)return error.toResponse();await new Promise(resolve=>setTimeout(resolve,50))}}async processRequestQueue(){for(let[request,promise]of this.getOrderedRequestQueue())try{this.requestQueue.delete(request),this.retryRequestQueue.delete(request);let response=await this.routeUserWorkerRequest(request);promise.resolve(response)}catch(cause){let error=ProxyError.fromUnknown(cause);error.retryable?this.retryRequestQueue.set(request,promise):promise.resolve(error.toResponse())}}*getOrderedRequestQueue(){yield*this.retryRequestQueue,yield*this.requestQueue}async routeUserWorkerRequest(request){let original=new URL(request.url),segments=original.hostname.split(`.`),name=segments[0]?decodeURIComponent(segments[0].toLowerCase()):void 0;if(segments.length<2||!name)throw new ProxyError({message:`The request hostname does not include a worker to route to.`,hint:\"The hostname should be in the format of `<worker-name>.localhost:<port>`, e.g. `my-worker.localhost:1337`.\",status:400});let worker=this.workers.get(name);if(!worker)throw new ProxyError({message:`Worker \"${name}\" not found`,status:502});let localAddress=worker.localAddress;if(!localAddress)throw new ProxyError({message:`Worker address not yet available`,status:503,retryable:!0});try{let proxied=new URL(original.pathname+original.search,localAddress),headers=new Headers(request.headers);return headers.set(`x-forwarded-host`,original.host),headers.set(`x-forwarded-proto`,original.protocol.replace(/:$/,``)),await fetch(proxied,{method:request.method,headers,body:request.body,redirect:`manual`})}catch(error){let worker=this.workers.get(name);throw!worker||worker.localAddress===localAddress?new ProxyError({message:`Failed to fetch worker \"${name}\" (local address: ${localAddress})`,status:502,cause:error}):new ProxyError({message:`Your worker restarted mid-request.`,hint:`Try sending the request again. Only GET and HEAD requests are retried automatically.`,status:503,retryable:request.method===`GET`||request.method===`HEAD`,cause:error})}}},local_proxy_worker_default=local_proxy_worker_default$1??{};export{LocalProxy,local_proxy_worker_default as default};" },
+   { name: "index-workers-D-dEN6oB.mjs", type: "ESModule", content: __workerModule0 },
+   { name: "proxy.shared-CJStcZJN.mjs", type: "ESModule", content: __workerModule1 },
+ ];

@@ -1,0 +1,25 @@
+{
+  "name": "@repro/infra",
+  "private": true,
+  "type": "module",
+  "module": "alchemy.run.ts",
+  "scripts": {
+    "dev": "alchemy dev"
+  },
+  "dependencies": {
+    "@effect/platform-bun": "catalog:",
+    "@effect/platform-node": "catalog:",
+    "@repro/worker-a": "workspace:*",
+    "@repro/worker-b": "workspace:*",
+    "@repro/worker-c": "workspace:*",
+    "alchemy": "catalog:",
+    "effect": "catalog:"
+  },
+  "devDependencies": {
+    "@types/bun": "catalog:",
+    "wrangler": "catalog:"
+  },
+  "peerDependencies": {
+    "typescript": "catalog:"
+  }
+}

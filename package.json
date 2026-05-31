@@ -1,0 +1,27 @@
+{
+	"name": "alchemy-repro",
+	"version": "0.0.1",
+	"private": true,
+	"workspaces": [
+		"packages/*"
+	],
+	"scripts": {
+		"dev": "bun run --filter '@repro/infra' --elide-lines=0 dev",
+		"clean": "fd -t d '^(node_modules|\\.alchemy)$' -HI -X rm -rf"
+	},
+	"devDependencies": {
+		"@types/bun": "latest"
+	},
+	"peerDependencies": {
+		"typescript": "catalog:"
+	},
+	"catalog": {
+		"@effect/platform-bun": "4.0.0-beta.74",
+		"@effect/platform-node": "4.0.0-beta.74",
+		"alchemy": "2.0.0-beta.44",
+		"effect": "4.0.0-beta.74",
+		"@types/bun": "latest",
+		"wrangler": "^4.95.0",
+		"typescript": "^6.0.3"
+	}
+}
