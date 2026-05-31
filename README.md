@@ -19,11 +19,13 @@ packages/
 
 Each worker is the same `effect/unstable/httpapi` stack used in production
 (`HttpApi` + `HttpApiBuilder` + `HttpApiScalar`), exposing:
-- `GET /`            → `Hello via Bun! - @repro/worker-x`
+
+- `GET /` → `Hello via Bun! - @repro/worker-x`
 - `GET /favicon.ico` → 204
-- `GET /docs`        → Scalar UI
+- `GET /docs` → Scalar UI
 
 Pinned versions (match the affected project):
+
 - `alchemy@2.0.0-beta.44` → pulls `@distilled.cloud/cloudflare-runtime@0.6.3`
 - `effect@4.0.0-beta.74`
 - Bun `1.3.13`, `bunfig.toml` → `[run] bun = true`, `[install] linker = "isolated"`
@@ -44,7 +46,7 @@ The single patch file fixes **two** distinct dev-runtime bugs in
 They **compound**: bug #1 leaves a worker permanently down, and pinging that
 worker is the cleanest deterministic trigger for bug #2 (the proxy retries a
 `503` for an address that will never appear, forever) — OOM in ~2 minutes. So
-this repo reproduces *both* from one unpatched `bun dev`.
+this repo reproduces _both_ from one unpatched `bun dev`.
 
 ## Reproduce
 
@@ -148,7 +150,7 @@ Bun to drop. This makes startup runtime-agnostic. `./run-harness.sh --patch` con
 
 The same patch file carries a second fix. The `run-harness.sh` flow doesn't hit
 it (it kills each run within seconds), but it **is** reproducible in this repo by
-hand — and bug #1 makes it deterministic (see *Reproduce* below).
+hand — and bug #1 makes it deterministic (see _Reproduce_ below).
 
 **Symptom.** `alchemy dev` with ≥2 workers crashed the dev runtime after ~2
 minutes with a V8 fatal `ExternalEntityTable::AllocateEntry: allocation failed:
@@ -239,11 +241,11 @@ curl http://workerc.localhost:1337/        # hangs (retryable 503, retried forev
 │
 │ *** Received signal #6: Abort trap: 6
 │ stack: 18a4a98d7 18a3b0643 1019382a3 101d9c1c7 101d9c177 101db5957 101db3ac7 101da9403 101943a47 100a82433 101dfdaf7 101dfd163 101c5560b 101ba63af 15000af63 15000bd93 101be8f63 101cd86b7 101bd8257 101ba6f9b 101eeb2af 101eebbd3 101eebd13 101f00f33 101f00d9f 10190cf23 10123bee3 10123bab7 101234da3
- 
+
 # restore: git checkout package.json && bun i
 ```
 
-This is the cleanest trigger: a worker that *never* starts (bug #1) keeps the
+This is the cleanest trigger: a worker that _never_ starts (bug #1) keeps the
 proxy's `localAddress` for it permanently unset, so the request stays retryable
 `503` forever and the hot-loop never stops — versus a merely slow-starting worker,
 where the window closes once it comes up. Under the patch, the curl just retries

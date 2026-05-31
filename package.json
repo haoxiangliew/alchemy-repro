@@ -1,27 +1,36 @@
 {
-	"name": "alchemy-repro",
-	"version": "0.0.1",
-	"private": true,
-	"workspaces": [
-		"packages/*"
-	],
-	"scripts": {
-		"dev": "bun run --filter '@repro/infra' --elide-lines=0 dev",
-		"clean": "fd -t d '^(node_modules|\\.alchemy)$' -HI -X rm -rf"
-	},
-	"devDependencies": {
-		"@types/bun": "latest"
-	},
-	"peerDependencies": {
-		"typescript": "catalog:"
-	},
-	"catalog": {
-		"@effect/platform-bun": "4.0.0-beta.74",
-		"@effect/platform-node": "4.0.0-beta.74",
-		"alchemy": "2.0.0-beta.44",
-		"effect": "4.0.0-beta.74",
-		"@types/bun": "latest",
-		"wrangler": "^4.95.0",
-		"typescript": "^6.0.3"
-	}
+  "name": "alchemy-repro",
+  "version": "0.0.1",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "bun run --filter '@repro/infra' --elide-lines=0 dev",
+    "lint": "oxlint .",
+    "lint:fix": "oxlint . --fix",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "clean": "fd -t d '^(node_modules|\\.alchemy)$' -HI -X rm -rf"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "oxfmt": "^0.52.0",
+    "oxlint": "^1.67.0"
+  },
+  "peerDependencies": {
+    "typescript": "catalog:"
+  },
+  "catalog": {
+    "@effect/platform-bun": "4.0.0-beta.74",
+    "@effect/platform-node": "4.0.0-beta.74",
+    "alchemy": "2.0.0-beta.44",
+    "effect": "4.0.0-beta.74",
+    "@types/bun": "latest",
+    "wrangler": "^4.95.0",
+    "typescript": "^6.0.3"
+  },
+  "patchedDependencies": {
+    "@distilled.cloud/cloudflare-runtime@0.6.3": "patches/@distilled.cloud%2Fcloudflare-runtime@0.6.3.patch"
+  }
 }

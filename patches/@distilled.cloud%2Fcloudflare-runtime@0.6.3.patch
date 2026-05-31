@@ -1,54 +1,80 @@
-diff --git a/node_modules/@distilled.cloud/cloudflare-runtime/.bun-tag-26e21102174475b1 b/.bun-tag-26e21102174475b1
+diff --git a/node_modules/@distilled.cloud/cloudflare-runtime/.bun-tag-f5d97f9bad8a3208 b/.bun-tag-f5d97f9bad8a3208
 new file mode 100644
 index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/dist/internal/find-available-port.mjs b/dist/internal/find-available-port.mjs
+index 153f3b3de00d944a9e91add08da94ad544454d5e..2c4c83b62a78951236f54099077eaa809ecc8b96 100644
+--- a/dist/internal/find-available-port.mjs
++++ b/dist/internal/find-available-port.mjs
+@@ -30,7 +30,22 @@ const isPortAvailable = (port, host) => Effect.callback((resume) => {
+ 	});
+ 	server.listen(port, host);
+ });
++// Bind an ephemeral port (`:0`) and return the one the OS assigned.
++const allocatePort = (host = "127.0.0.1") => Effect.callback((resume) => {
++	const server = Net.createServer();
++	server.once("error", (cause) => {
++		resume(new SystemError({
++			subtag: "PortAllocationFailed",
++			message: `Failed to allocate an ephemeral port on ${host}.`,
++			cause
++		}));
++	});
++	server.listen(0, host, () => {
++		const { port } = server.address();
++		server.close(() => resume(Effect.succeed(port)));
++	});
++});
+ //#endregion
+-export { findAvailablePort };
++export { allocatePort, findAvailablePort, isPortAvailable };
+ 
+ //# sourceMappingURL=find-available-port.mjs.map
+\ No newline at end of file
 diff --git a/dist/workerd/Workerd.mjs b/dist/workerd/Workerd.mjs
-index 0edaecd6635c8f2ce69b96e7c5474453c7abc690..b62ec3ba321f02a478eef1a665dddc25c8570ef1 100644
+index 0edaecd6635c8f2ce69b96e7c5474453c7abc690..ac9913828c3d45161e63c0fcf28cfa109e3ac57d 100644
 --- a/dist/workerd/Workerd.mjs
 +++ b/dist/workerd/Workerd.mjs
-@@ -8,7 +8,7 @@ import * as Effect from "effect/Effect";
+@@ -8,13 +8,19 @@ import * as Effect from "effect/Effect";
  import * as Layer from "effect/Layer";
  import * as Schedule from "effect/Schedule";
  import * as NodeChildProcess from "node:child_process";
 -import * as NodeStream from "node:stream";
 +import * as NodeNet from "node:net";
++import * as NodeFs from "node:fs";
++import * as NodeOs from "node:os";
++import * as NodePath from "node:path";
++import { allocatePort, isPortAvailable } from "../internal/find-available-port.mjs";
  //#region src/workerd/Workerd.ts
  var Workerd_exports = /* @__PURE__ */ __exportAll({
  	Workerd: () => Workerd,
-@@ -56,61 +56,113 @@ const WorkerdLive = Layer.sync(Workerd, () => {
+ 	WorkerdLive: () => WorkerdLive
+ });
+ var Workerd = class extends Context.Service()("cloudflare-runtime/workerd/Workerd") {};
++// Distinguishes the temp config files written by concurrent `serve` calls.
++let configSeq = 0;
+ const WorkerdLive = Layer.sync(Workerd, () => {
+ 	const spawn = (command, args, spawnOptions) => Effect.callback((resume) => {
+ 		const handle = NodeChildProcess.spawn(command, args, spawnOptions);
+@@ -56,58 +62,121 @@ const WorkerdLive = Layer.sync(Workerd, () => {
  	return Workerd.of({
  		compatibilityDate,
  		serve: Effect.fn("Workerd.serve")(function* (config, args) {
-+			// Pre-assign a concrete loopback port for every ":0" socket and
-+			// port-valued arg, instead of letting workerd pick ephemeral ports
-+			// and reporting them back over the control fd (fd 3). Bun's
-+			// child_process intermittently fails to wire that extra pipe into a
-+			// spawned child (the "listen" messages get written to a dead fd),
-+			// which left the worker running-but-unaddressable: no "Started"
-+			// log, no error, random victim, worse with more workers. Choosing
-+			// the ports up front removes the dependency on fd 3 entirely.
-+			const allocatePort = () => new Promise((resolve, reject) => {
-+				const probe = NodeNet.createServer();
-+				probe.once("error", reject);
-+				probe.listen(0, "127.0.0.1", () => {
-+					const { port } = probe.address();
-+					probe.close(() => resolve(port));
-+				});
-+			});
-+			const portOf = (address) => {
-+				const port = Number(String(address).split(":").pop());
-+				return Number.isFinite(port) ? port : undefined;
-+			};
++			// Pre-assign a concrete loopback port for each ":0" socket and
++			// port-valued arg instead of letting workerd pick ephemeral ports and
++			// report them back over the control fd (fd 3): under Bun, child_process
++			// intermittently drops that extra pipe, leaving the worker up but
++			// unaddressable with no "Started" log and no error. We poll the port for
++			// readiness instead, which removes the dependency on fd 3.
 +			const ports = {};
 +			const sockets = [];
 +			for (const socket of config.sockets ?? []) {
 +				if (typeof socket.address === "string" && socket.address.endsWith(":0")) {
-+					const port = yield* Effect.promise(allocatePort);
++					const port = yield* allocatePort();
 +					ports[socket.name] = port;
 +					sockets.push({ ...socket, address: `127.0.0.1:${port}` });
 +				} else {
-+					// Already-concrete sockets (e.g. the proxy's fixed :1337):
-+					// keep the address, but still record the port so the
-+					// returned shape matches the old control-fd behaviour.
++					// Concrete sockets (e.g. the proxy's fixed :1337) keep their address,
++					// but we still record the port so the returned shape is unchanged.
 +					const port = portOf(socket.address);
 +					if (port !== undefined) ports[socket.name] = port;
 +					sockets.push(socket);
@@ -59,7 +85,7 @@ index 0edaecd6635c8f2ce69b96e7c5474453c7abc690..b62ec3ba321f02a478eef1a665dddc25
 +				const value = resolvedArgs[key];
 +				if (typeof value !== "string") continue;
 +				if (value.endsWith(":0")) {
-+					const port = yield* Effect.promise(allocatePort);
++					const port = yield* allocatePort();
 +					ports[key] = port;
 +					resolvedArgs[key] = `127.0.0.1:${port}`;
 +				} else {
@@ -70,7 +96,21 @@ index 0edaecd6635c8f2ce69b96e7c5474453c7abc690..b62ec3ba321f02a478eef1a665dddc25
 +			const resolvedConfig = { ...config, sockets };
 +			const httpSocket = sockets.find((socket) => socket.name === "http") ?? sockets[0];
 +			const readinessPort = httpSocket ? portOf(httpSocket.address) : undefined;
++			// Whether the readiness port is free *before* we spawn. If it is, a later
++			// TCP connect confirms our worker is listening. If it is already taken (a
++			// concrete address colliding with another process), workerd can't bind it
++			// and will exit, so we must not connect-probe — that would answer from
++			// the other listener and falsely report ready.
++			const readinessPortFree = readinessPort === undefined ? undefined : yield* isPortAvailable(readinessPort, "127.0.0.1");
 +
++			// Pass the config as a file rather than over stdin: the same spawn race
++			// can drop the stdin pipe, leaving workerd to read EOF, get no config,
++			// and exit 1 within milliseconds. A file path has no such dependency.
++			const configPath = NodePath.join(NodeOs.tmpdir(), `workerd-config-${process.pid}-${configSeq++}.bin`);
++			yield* Effect.promise(() => NodeFs.promises.writeFile(configPath, Buffer.from(serializeConfig(resolvedConfig))));
++			yield* Effect.addFinalizer(() => Effect.sync(() => {
++				try { NodeFs.rmSync(configPath, { force: true }); } catch {}
++			}));
  			const [handle, kill] = yield* spawn(bin, [
  				"serve",
  				"--binary",
@@ -78,10 +118,12 @@ index 0edaecd6635c8f2ce69b96e7c5474453c7abc690..b62ec3ba321f02a478eef1a665dddc25
  				"--verbose",
 -				"--control-fd=3",
 -				...Object.entries(args ?? {}).map(([key, value]) => typeof value === "boolean" ? `--${key}` : `--${key}=${value}`),
+-				"-"
 +				...Object.entries(resolvedArgs).map(([key, value]) => typeof value === "boolean" ? `--${key}` : `--${key}=${value}`),
- 				"-"
++				configPath
  			], { stdio: [
- 				"pipe",
+-				"pipe",
++				"ignore",
  				"inherit",
 -				"pipe",
  				"pipe"
@@ -109,12 +151,6 @@ index 0edaecd6635c8f2ce69b96e7c5474453c7abc690..b62ec3ba321f02a478eef1a665dddc25
 -						removeListeners();
 -						resume(Effect.succeed(messages));
 -					}
--				};
--				const onExit = (code, signal) => {
--					removeListeners();
--					resume(classifyWorkerdError(stderr, code, signal));
--				};
--				const removeListeners = () => {
 +				let settled = false;
 +				let pollTimer;
 +				let deadline;
@@ -122,33 +158,53 @@ index 0edaecd6635c8f2ce69b96e7c5474453c7abc690..b62ec3ba321f02a478eef1a665dddc25
 +				const cleanup = () => {
 +					clearTimeout(pollTimer);
 +					clearTimeout(deadline);
- 					handle.stderr?.off("data", onStderr);
--					handle.stdio[3]?.off("data", onControl);
- 					handle.off("exit", onExit);
++					handle.stderr?.off("data", onStderr);
++					handle.off("close", onExit);
  				};
+-				const onExit = (code, signal) => {
+-					removeListeners();
+-					resume(classifyWorkerdError(stderr, code, signal));
 +				const settle = (effect) => {
 +					if (settled) return;
 +					settled = true;
 +					cleanup();
 +					resume(effect);
-+				};
+ 				};
+-				const removeListeners = () => {
+-					handle.stderr?.off("data", onStderr);
+-					handle.stdio[3]?.off("data", onControl);
+-					handle.off("exit", onExit);
++				// Use "close" (not "exit") so workerd's stderr is fully drained
++				// before we classify the failure — on "exit" the final chunk can
++				// still be in flight, which would mislabel an "address in use" bind
++				// failure (ConfigError) as a generic SystemError.
 +				const onExit = (code, signal) => settle(classifyWorkerdError(stderr, code, signal));
 +				const probe = () => {
++					if (readinessPort === undefined) {
++						// No port to confirm a listen against; staying up is our only signal.
++						settle(Effect.void);
++						return;
++					}
++					if (readinessPortFree === false) {
++						// A pre-existing listener owns the port; wait for workerd's bind
++						// failure on exit rather than connecting to the other process.
++						return;
++					}
 +					const socket = NodeNet.connect(readinessPort, "127.0.0.1");
 +					socket.once("connect", () => { socket.destroy(); settle(Effect.void); });
 +					socket.once("error", () => { socket.destroy(); pollTimer = setTimeout(probe, 50); });
-+				};
+ 				};
  				handle.stderr?.on("data", onStderr);
 -				handle.stdio[3]?.on("data", onControl);
- 				handle.on("exit", onExit);
+-				handle.on("exit", onExit);
 -				handle.stdin?.write(Buffer.from(serializeConfig(config)));
+-				handle.stdin?.end();
+-				return Effect.sync(removeListeners);
++				handle.on("close", onExit);
 +				deadline = setTimeout(() => settle(new SystemError({
 +					subtag: "WorkerdStartTimeout",
 +					message: "The Workers runtime (workerd) did not start listening in time."
 +				})), 30e3);
-+				handle.stdin?.write(Buffer.from(serializeConfig(resolvedConfig)));
- 				handle.stdin?.end();
--				return Effect.sync(removeListeners);
 +				probe();
 +				return Effect.sync(cleanup);
  			});
@@ -156,11 +212,19 @@ index 0edaecd6635c8f2ce69b96e7c5474453c7abc690..b62ec3ba321f02a478eef1a665dddc25
 -			for (const message of controlMessages) if (message.event === "listen") ports[message.socket] = message.port;
  			return ports;
  		}, (effect) => Effect.retry(effect, {
--			while: (error) => error._tag === "SystemError",
-+			while: (error) => error._tag === "SystemError" || error.subtag === "WorkerdAddressInUse",
- 			schedule: Schedule.both(Schedule.exponential(50), Schedule.recurs(3))
+ 			while: (error) => error._tag === "SystemError",
+@@ -115,6 +184,11 @@ const WorkerdLive = Layer.sync(Workerd, () => {
  		}))
  	});
+ });
++// Extract the numeric port from a `host:port` address string.
++const portOf = (address) => {
++	const port = Number(String(address).split(":").pop());
++	return Number.isFinite(port) ? port : undefined;
++};
+ /**
+ * Workerd writes failures to stderr in a few well-known shapes. This
+ * classifier inspects the captured stderr and decides whether the failure
 diff --git a/dist/workers/proxy/workers/local-proxy.worker.mjs b/dist/workers/proxy/workers/local-proxy.worker.mjs
 index c144780f0cfcdac28c3378bb07b28558514a87d1..7cdbfe668cf4479710e58e15af5b72c43e3bced2 100644
 --- a/dist/workers/proxy/workers/local-proxy.worker.mjs

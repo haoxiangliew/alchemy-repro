@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc"],
+  "categories": {
+    "correctness": "error"
+  },
+  "rules": {
+    "require-yield": "off",
+    "sort-imports": ["warn", { "ignoreDeclarationSort": true }]
+  },
+  "env": {
+    "builtin": true
+  }
+}
