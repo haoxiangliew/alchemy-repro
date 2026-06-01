@@ -95,7 +95,7 @@ This race has **two faces**, both the same Bun bug. The control fd (fd 3) is the
 one the original fix removed — but pre-allocating ports and dropping fd 3 still
 left a residual ~1-in-10 failure (diagnosed in this repro). The runtime also
 pipes each worker's serialized config to `workerd` over **stdin (fd 0)**, and the
-same concurrent-spawn race intermittently drops *that* pipe too. When it does,
+same concurrent-spawn race intermittently drops _that_ pipe too. When it does,
 `workerd` reads EOF, gets no config, and exits `1` within ~4 ms — no stdout, no
 stderr, just a silent non-start. The retry loop usually masks it, which is why it
 surfaced as the occasional surviving failure rather than every run.
@@ -191,6 +191,8 @@ run 60/60.
 ```
 
 ## Fix #2 — LocalProxy OOM
+
+**Fixed Upstream**: https://github.com/alchemy-run/cloudflare-tools/pull/34
 
 (`patches/`, `local-proxy.worker.mjs`)
 
